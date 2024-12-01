@@ -6,12 +6,18 @@
 #include <iostream>
 #include <string>
 #include <chrono> // For timing
+#include <vector>
+#include <fstream>
 
 using namespace cv;
 using namespace std;
 using namespace std::chrono;
 
-void applyCUDAGaussianBlur(const std::string& inputImagePath, const std::string& outputImagePath, int ksize = 9) {
+void resizeToFullHD(Mat& image) {
+    resize(image, image, Size(1920, 1080), 0, 0, INTER_LINEAR);
+}
+
+void applyCPUKMeansSegmentation(const std::string& inputImagePath, const std::string& outputImagePath, int k, milliseconds& duration, bool resizeToHD = false) {
     // Read the input image
     Mat image = imread(inputImagePath);
     if (image.empty()) {
@@ -19,59 +25,9 @@ void applyCUDAGaussianBlur(const std::string& inputImagePath, const std::string&
         return;
     }
 
-    // Upload image to GPU
-    cuda::GpuMat d_image;
-    d_image.upload(image);
-
-    // Create Gaussian filter
-    Ptr<cuda::Filter> gaussianFilter = cuda::createGaussianFilter(d_image.type(), d_image.type(), Size(ksize, ksize), 0);
-
-    // Apply Gaussian blur on GPU
-    cuda::GpuMat d_blurred;
-    gaussianFilter->apply(d_image, d_blurred);
-
-    // Download result back to CPU
-    Mat blurred;
-    d_blurred.download(blurred);
-
-    // Save the blurred image to the output path
-    imwrite(outputImagePath, blurred);
-
-    cout << "CUDA Gaussian blur completed and saved to " << outputImagePath << endl;
-}
-
-void applyCUDAImageInversion(const std::string& inputImagePath, const std::string& outputImagePath) {
-    // Read the input image
-    Mat image = imread(inputImagePath);
-    if (image.empty()) {
-        cerr << "Error: Could not open or find the image!" << endl;
-        return;
-    }
-
-    // Upload image to GPU
-    cuda::GpuMat d_image;
-    d_image.upload(image);
-
-    // Invert the image on GPU
-    cuda::GpuMat d_inverted;
-    cuda::bitwise_not(d_image, d_inverted);
-
-    // Download result back to CPU
-    Mat inverted;
-    d_inverted.download(inverted);
-
-    // Save the inverted image to the output path
-    imwrite(outputImagePath, inverted);
-
-    cout << "CUDA image inversion completed and saved to " << outputImagePath << endl;
-}
-
-void applyCPUKMeansSegmentation(const std::string& inputImagePath, const std::string& outputImagePath, int k) {
-    // Read the input image
-    Mat image = imread(inputImagePath);
-    if (image.empty()) {
-        cerr << "Error: Could not open or find the image!" << endl;
-        return;
+    // Resize to Full HD if requested
+    if (resizeToHD) {
+        resizeToFullHD(image);
     }
 
     // Convert the image into a 2D array of pixels (each pixel is a vector of RGB values)
@@ -89,7 +45,7 @@ void applyCPUKMeansSegmentation(const std::string& inputImagePath, const std::st
 
     // End timing
     auto end = high_resolution_clock::now();
-    auto duration = duration_cast<milliseconds>(end - start);
+    duration = duration_cast<milliseconds>(end - start);
 
     cout << "CPU K-Means completed in " << duration.count() << " ms with compactness: " << compactness << endl;
 
@@ -105,15 +61,20 @@ void applyCPUKMeansSegmentation(const std::string& inputImagePath, const std::st
     // Save the segmented image to the output path
     imwrite(outputImagePath, segmentedImage);
 
-    cout << "CPU-based image segmentation saved to " << outputImagePath << endl;
+    // cout << "CPU-based image segmentation saved to " << outputImagePath << endl;
 }
 
-void applyGPUKMeansSegmentation(const std::string& inputImagePath, const std::string& outputImagePath, int k) {
+void applyGPUKMeansSegmentation(const std::string& inputImagePath, const std::string& outputImagePath, int k, milliseconds& duration, bool resizeToHD = false) {
     // Read the input image
     Mat image = imread(inputImagePath);
     if (image.empty()) {
         cerr << "Error: Could not open or find the image!" << endl;
         return;
+    }
+
+    // Resize to Full HD if requested
+    if (resizeToHD) {
+        resizeToFullHD(image);
     }
 
     // Convert the image into a 2D array of pixels
@@ -141,7 +102,7 @@ void applyGPUKMeansSegmentation(const std::string& inputImagePath, const std::st
 
     // End timing
     auto end = high_resolution_clock::now();
-    auto duration = duration_cast<milliseconds>(end - start);
+    duration = duration_cast<milliseconds>(end - start);
 
     cout << "GPU K-Means completed in " << duration.count() << " ms with compactness: " << compactness << endl;
 
@@ -164,52 +125,106 @@ void applyGPUKMeansSegmentation(const std::string& inputImagePath, const std::st
     // Save the segmented image to the output path
     imwrite(outputImagePath, segmentedImage);
 
-    cout << "GPU-based image segmentation saved to " << outputImagePath << endl;
+    // cout << "GPU-based image segmentation saved to " << outputImagePath << endl;
+}
+
+struct BenchmarkResult {
+    int k;
+    double avg_speedup;
+    double avg_psnr;
+};
+
+std::vector<BenchmarkResult> benchmarkKMeans(const vector<string>& imageNames, int k_min, int k_max, bool resizeToHD = false) {
+    std::vector<BenchmarkResult> results;
+    string inputDir = "../image/";
+    string outputDir = "../output/";
+
+    // For each k value
+    for (int k = k_min; k <= k_max; ++k) {
+        double total_speedup = 0.0;
+        double total_psnr = 0.0;
+        int valid_comparisons = 0;
+
+        // For each image
+        for (const auto& imageName : imageNames) {
+            string inputImagePath = inputDir + imageName;
+            string cpuOutputPath = outputDir + "cpu_k" + to_string(k) + "_" + 
+                                 (resizeToHD ? "hd_" : "") + imageName;
+            string gpuOutputPath = outputDir + "gpu_k" + to_string(k) + "_" + 
+                                 (resizeToHD ? "hd_" : "") + imageName;
+
+            // Get CPU duration
+            milliseconds cpu_duration;
+            applyCPUKMeansSegmentation(inputImagePath, cpuOutputPath, k, cpu_duration, resizeToHD);
+
+            // Get GPU duration
+            milliseconds gpu_duration;
+            applyGPUKMeansSegmentation(inputImagePath, gpuOutputPath, k, gpu_duration, resizeToHD);
+
+            // Calculate speedup
+            double speedup = static_cast<double>(cpu_duration.count()) / gpu_duration.count();
+            total_speedup += speedup;
+
+            // Calculate PSNR
+            Mat cpuResult = imread(cpuOutputPath);
+            Mat gpuResult = imread(gpuOutputPath);
+            if (!cpuResult.empty() && !gpuResult.empty()) {
+                double psnr = PSNR(cpuResult, gpuResult);
+                total_psnr += psnr;
+                valid_comparisons++;
+            }
+
+            cout << "k=" << k << ", image=" << imageName 
+                 << ", speedup=" << speedup 
+                 << "x, PSNR=" << (total_psnr/valid_comparisons) << " dB" << endl;
+        }
+
+        // Store average results for this k
+        BenchmarkResult result;
+        result.k = k;
+        result.avg_speedup = total_speedup / imageNames.size();
+        result.avg_psnr = total_psnr / valid_comparisons;
+        results.push_back(result);
+    }
+
+    return results;
 }
 
 int main(int argc, char** argv) {
-    // Ensure proper usage
-    if (argc != 2) {
-        cerr << "Usage: " << argv[0] << " <image_name>" << endl;
-        return 1;
-    }
-
-    int deviceCount = cv::cuda::getCudaEnabledDeviceCount();
-    std::cout << "Number of CUDA devices: " << deviceCount << std::endl;
-
-    if (deviceCount == 0) {
-        cerr << "No CUDA devices found. Exiting." << endl;
-        return -1;
-    }
-
     // Select the first CUDA device
     cv::cuda::setDevice(0);
 
-    // File paths
-    string inputDir = "../image/";
-    string outputDir = "../output/";
-    string imageName = argv[1];
-    string inputImagePath = inputDir + imageName;
+    // List of images to process
+    vector<string> imageNames = {
+        "4k_1.jpeg", "4k_2.jpeg", "4k_3.jpeg", "4k_4.jpeg",
+        "4k_5.jpeg", "4k_6.jpeg", "4k_7.jpeg", "4k_8.jpeg"
+    };
 
-    // Number of clusters for K-Means
-    int k = 10;  // You can adjust this
+    // Run benchmarks for both 4K and Full HD
+    // cout << "Running 4K benchmarks..." << endl;
+    // auto results_4k = benchmarkKMeans(imageNames, 2, 10, false);
+    
+    cout << "\nRunning Full HD benchmarks..." << endl;
+    auto results_hd = benchmarkKMeans(imageNames, 2, 10, true);
 
-    // Perform CPU K-Means segmentation
-    string cpuSegmentedImagePath = outputDir + "cpu_segmented_" + imageName;
-    applyCPUKMeansSegmentation(inputImagePath, cpuSegmentedImagePath, k);
+    // Save results to separate CSV files
+    // ofstream outFile4k("benchmark_results_4k.csv");
+    // outFile4k << "k,speedup,psnr\n";
+    // for (const auto& result : results_4k) {
+    //     outFile4k << result.k << "," 
+    //              << result.avg_speedup << "," 
+    //              << result.avg_psnr << "\n";
+    // }
+    // outFile4k.close();
 
-    // Perform GPU K-Means segmentation
-    string gpuSegmentedImagePath = outputDir + "gpu_segmented_" + imageName;
-    applyGPUKMeansSegmentation(inputImagePath, gpuSegmentedImagePath, k);
-
-    // // Perform CUDA image inversion
-    // string invertedImagePath = outputDir + "cuda_inverted_" + imageName;
-    // applyCUDAImageInversion(inputImagePath, invertedImagePath);
-
-    // // Perform CUDA Gaussian blur
-    // string blurredImagePath = outputDir + "cuda_blurred_" + imageName;
-    // int blurKernelSize = 9;  // You can adjust the kernel size
-    // applyCUDAGaussianBlur(inputImagePath, blurredImagePath, blurKernelSize);
+    ofstream outFileHD("benchmark_results_hd.csv");
+    outFileHD << "k,speedup,psnr\n";
+    for (const auto& result : results_hd) {
+        outFileHD << result.k << "," 
+                 << result.avg_speedup << "," 
+                 << result.avg_psnr << "\n";
+    }
+    outFileHD.close();
 
     return 0;
 }
